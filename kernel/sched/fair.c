@@ -2173,7 +2173,6 @@ static inline bool is_core_idle(int cpu)
 }
 
 #ifdef CONFIG_NUMA
-#define NUMA_IMBALANCE_MIN 2
 
 static inline long
 adjust_numa_imbalance(int imbalance, int dst_running, int imb_numa_nr)
@@ -2191,8 +2190,11 @@ adjust_numa_imbalance(int imbalance, int dst_running, int imb_numa_nr)
 	/*
 	 * Allow a small imbalance based on a simple pair of communicating
 	 * tasks that remain local when the destination is lightly loaded.
+	 * The allowance is capped at 4 to cover the pair (2 busy CPUs)
+	 * plus transient kernel-thread noise (1-2 busy CPUs) without
+	 * allowing independent throughput tasks to accumulate.
 	 */
-	if (imbalance <= NUMA_IMBALANCE_MIN)
+	if (imbalance <= min(imb_numa_nr, 4))
 		return 0;
 
 	return imbalance;
