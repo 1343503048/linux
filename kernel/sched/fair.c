@@ -12402,7 +12402,8 @@ sched_balance_find_dst_group(struct sched_domain *sd, struct task_struct *p, int
 				imb_numa_nr = min(w, sd->imb_numa_nr);
 			}
 
-			imbalance = abs(local_sgs.idle_cpus - idlest_sgs.idle_cpus);
+			imbalance = abs((idlest_sgs.group_weight - idlest_sgs.idle_cpus) -
+					(local_sgs.group_weight - local_sgs.idle_cpus));
 			if (!adjust_numa_imbalance(imbalance,
 						   local_sgs.sum_nr_running + 1,
 						   imb_numa_nr)) {
