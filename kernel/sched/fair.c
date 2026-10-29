@@ -12677,12 +12677,15 @@ static inline void calculate_imbalance(struct lb_env *env, struct sd_lb_stats *s
 		} else {
 
 			/*
-			 * If there is no overload, we just want to even the number of
-			 * idle CPUs.
+			 * If there is no overload, we just want to even the
+			 * number of busy CPUs. Busy CPUs is preferred over
+			 * idle CPUs because local and busiest groups can have
+			 * different weights (e.g. multi-level NUMA domains).
 			 */
 			env->migration_type = migrate_task;
-			env->imbalance = max_t(long, 0,
-					       (local->idle_cpus - busiest->idle_cpus));
+			env->imbalance = busiest->group_weight - busiest->idle_cpus;
+			lsub_positive(&env->imbalance,
+				      local->group_weight - local->idle_cpus);
 		}
 
 #ifdef CONFIG_NUMA
