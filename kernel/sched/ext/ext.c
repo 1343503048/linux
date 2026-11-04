@@ -7167,7 +7167,7 @@ static void scx_root_enable_workfn(struct kthread_work *work)
 	 * returns non-NULL; the rcu_assign_pointer() below pairs with their
 	 * rcu_dereference() to make the populated arrays visible.
 	 */
-	ret = scx_cid_init(sch);
+	ret = scx_cid_init();
 	if (ret) {
 		cpus_read_unlock();
 		goto err_disable;

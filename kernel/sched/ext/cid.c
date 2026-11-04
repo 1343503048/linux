@@ -70,9 +70,139 @@ static s32 scx_cid_arrays_alloc(void)
 	return 0;
 }
 
+/* Temporary masks are owned by scx_cid_init(); the builder only borrows them. */
+struct scx_cid_builder {
+	struct cpumask *to_walk;
+	struct cpumask *node_scratch;
+	struct cpumask *llc_scratch;
+	struct cpumask *core_scratch;
+	struct cpumask *llc_fallback;
+	u32 next_cid;
+	s32 next_node_idx;
+	s32 next_llc_idx;
+	s32 next_core_idx;
+};
+
+static s32 scx_cid_build_core(struct scx_cid_builder *b, struct scx_cid_topo topo)
+{
+	s32 cpu = cpumask_first(b->llc_scratch);
+	const struct cpumask *sib = topology_sibling_cpumask(cpu);
+	s32 ccpu;
+
+	topo.core_cid = b->next_cid;
+	topo.core_idx = b->next_core_idx++;
+
+	cpumask_and(b->core_scratch, b->llc_scratch, sib);
+	if (WARN_ON_ONCE(!cpumask_test_cpu(cpu, b->core_scratch)))
+		return -EINVAL;
+
+	for_each_cpu(ccpu, b->core_scratch) {
+		s32 cid = b->next_cid++;
+
+		scx_cid_to_cpu_tbl[cid] = ccpu;
+		scx_cpu_to_cid_tbl[ccpu] = cid;
+		scx_cid_topo[cid] = topo;
+
+		cpumask_clear_cpu(ccpu, b->llc_scratch);
+		cpumask_clear_cpu(ccpu, b->node_scratch);
+		cpumask_clear_cpu(ccpu, b->to_walk);
+	}
+
+	return 0;
+}
+
+static s32 scx_cid_build_llc(struct scx_cid_builder *b, struct scx_cid_topo topo)
+{
+	s32 cpu = cpumask_first(b->node_scratch);
+	const struct cpumask *llc_mask = cpu_llc_mask(cpu, b->llc_fallback);
+	s32 ret;
+
+	topo.llc_cid = b->next_cid;
+	topo.llc_idx = b->next_llc_idx++;
+
+	cpumask_and(b->llc_scratch, b->node_scratch, llc_mask);
+	if (WARN_ON_ONCE(!cpumask_test_cpu(cpu, b->llc_scratch)))
+		return -EINVAL;
+
+	while (!cpumask_empty(b->llc_scratch)) {
+		ret = scx_cid_build_core(b, topo);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static s32 scx_cid_build_node(struct scx_cid_builder *b, s32 cpu, s32 nid)
+{
+	struct scx_cid_topo topo = SCX_CID_TOPO_NEG;
+	s32 ret;
+
+	topo.node_cid = b->next_cid;
+	topo.node_idx = b->next_node_idx++;
+
+	cpumask_and(b->node_scratch, b->to_walk, cpumask_of_node(nid));
+	if (WARN_ON_ONCE(!cpumask_test_cpu(cpu, b->node_scratch)))
+		return -EINVAL;
+
+	while (!cpumask_empty(b->node_scratch)) {
+		ret = scx_cid_build_llc(b, topo);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static s32 scx_cid_build_online(struct scx_cid_builder *b)
+{
+	cpumask_copy(b->to_walk, cpu_online_mask);
+
+	while (!cpumask_empty(b->to_walk)) {
+		s32 cpu = cpumask_first(b->to_walk);
+		s32 nid = cpu_to_node(cpu);
+		s32 ret;
+
+		/*
+		 * No NUMA info: skip and let the tail loop assign a no-topo
+		 * cid. cpumask_of_node(-1) is undefined.
+		 */
+		if (nid < 0) {
+			cpumask_clear_cpu(cpu, b->to_walk);
+			continue;
+		}
+
+		ret = scx_cid_build_node(b, cpu, nid);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+/* Append unmapped possible CPUs, recording online ones for the final warning. */
+static void scx_cid_build_tail(struct scx_cid_builder *b,
+			       struct cpumask *online_no_topo)
+{
+	s32 cpu;
+
+	for_each_possible_cpu(cpu) {
+		s32 cid;
+
+		if (__scx_cpu_to_cid(cpu) != -1)
+			continue;
+		if (cpu_online(cpu))
+			cpumask_set_cpu(cpu, online_no_topo);
+
+		cid = b->next_cid++;
+		scx_cid_to_cpu_tbl[cid] = cpu;
+		scx_cpu_to_cid_tbl[cpu] = cid;
+		scx_cid_topo[cid] = SCX_CID_TOPO_NEG;
+	}
+}
+
 /**
  * scx_cid_init - build the cid mapping
- * @sch: the scx_sched being initialized; used as the scx_error() target
  *
  * See "Topological CPU IDs" in cid.h for the model. Walk online cpus by
  * intersection at each level (parent_scratch & this_level_mask), which keeps
@@ -80,7 +210,7 @@ static s32 scx_cid_arrays_alloc(void)
  * straddling two NUMA nodes into two LLC units. The caller must hold
  * cpus_read_lock.
  */
-s32 scx_cid_init(struct scx_sched *sch)
+s32 scx_cid_init(void)
 {
 	cpumask_var_t to_walk __free(free_cpumask_var) = CPUMASK_VAR_NULL;
 	cpumask_var_t node_scratch __free(free_cpumask_var) = CPUMASK_VAR_NULL;
@@ -88,8 +218,7 @@ s32 scx_cid_init(struct scx_sched *sch)
 	cpumask_var_t core_scratch __free(free_cpumask_var) = CPUMASK_VAR_NULL;
 	cpumask_var_t llc_fallback __free(free_cpumask_var) = CPUMASK_VAR_NULL;
 	cpumask_var_t online_no_topo __free(free_cpumask_var) = CPUMASK_VAR_NULL;
-	u32 next_cid = 0;
-	s32 next_node_idx = 0, next_llc_idx = 0, next_core_idx = 0;
+	struct scx_cid_builder b = {};
 	s32 cpu, ret;
 
 	/* CMASK_MAX_WORDS in cid.bpf.h covers NR_CPUS up to 8192 */
@@ -113,93 +242,17 @@ s32 scx_cid_init(struct scx_sched *sch)
 	for (cpu = 0; cpu < nr_cpu_ids; cpu++)
 		scx_cpu_to_cid_tbl[cpu] = -1;
 
-	cpumask_copy(to_walk, cpu_online_mask);
+	b.to_walk = to_walk;
+	b.node_scratch = node_scratch;
+	b.llc_scratch = llc_scratch;
+	b.core_scratch = core_scratch;
+	b.llc_fallback = llc_fallback;
 
-	while (!cpumask_empty(to_walk)) {
-		s32 next_cpu = cpumask_first(to_walk);
-		s32 nid = cpu_to_node(next_cpu);
-		s32 node_cid = next_cid;
-		s32 node_idx;
+	ret = scx_cid_build_online(&b);
+	if (ret)
+		return ret;
 
-		/*
-		 * No NUMA info: skip and let the tail loop assign a no-topo
-		 * cid. cpumask_of_node(-1) is undefined.
-		 */
-		if (nid < 0) {
-			cpumask_clear_cpu(next_cpu, to_walk);
-			continue;
-		}
-
-		node_idx = next_node_idx++;
-
-		/* node_scratch = to_walk & this node */
-		cpumask_and(node_scratch, to_walk, cpumask_of_node(nid));
-		if (WARN_ON_ONCE(!cpumask_test_cpu(next_cpu, node_scratch)))
-			return -EINVAL;
-
-		while (!cpumask_empty(node_scratch)) {
-			s32 ncpu = cpumask_first(node_scratch);
-			const struct cpumask *llc_mask = cpu_llc_mask(ncpu, llc_fallback);
-			s32 llc_cid = next_cid;
-			s32 llc_idx = next_llc_idx++;
-
-			/* llc_scratch = node_scratch & this llc */
-			cpumask_and(llc_scratch, node_scratch, llc_mask);
-			if (WARN_ON_ONCE(!cpumask_test_cpu(ncpu, llc_scratch)))
-				return -EINVAL;
-
-			while (!cpumask_empty(llc_scratch)) {
-				s32 lcpu = cpumask_first(llc_scratch);
-				const struct cpumask *sib = topology_sibling_cpumask(lcpu);
-				s32 core_cid = next_cid;
-				s32 core_idx = next_core_idx++;
-				s32 ccpu;
-
-				/* core_scratch = llc_scratch & this core */
-				cpumask_and(core_scratch, llc_scratch, sib);
-				if (WARN_ON_ONCE(!cpumask_test_cpu(lcpu, core_scratch)))
-					return -EINVAL;
-
-				for_each_cpu(ccpu, core_scratch) {
-					s32 cid = next_cid++;
-
-					scx_cid_to_cpu_tbl[cid] = ccpu;
-					scx_cpu_to_cid_tbl[ccpu] = cid;
-					scx_cid_topo[cid] = (struct scx_cid_topo){
-						.core_cid = core_cid,
-						.core_idx = core_idx,
-						.llc_cid = llc_cid,
-						.llc_idx = llc_idx,
-						.node_cid = node_cid,
-						.node_idx = node_idx,
-					};
-
-					cpumask_clear_cpu(ccpu, llc_scratch);
-					cpumask_clear_cpu(ccpu, node_scratch);
-					cpumask_clear_cpu(ccpu, to_walk);
-				}
-			}
-		}
-	}
-
-	/*
-	 * No-topo section: any possible cpu without a cid - normally just the
-	 * not-online ones. Collect any currently-online cpus that land here in
-	 * @online_no_topo so we can warn about them at the end.
-	 */
-	for_each_cpu(cpu, cpu_possible_mask) {
-		s32 cid;
-
-		if (__scx_cpu_to_cid(cpu) != -1)
-			continue;
-		if (cpu_online(cpu))
-			cpumask_set_cpu(cpu, online_no_topo);
-
-		cid = next_cid++;
-		scx_cid_to_cpu_tbl[cid] = cpu;
-		scx_cpu_to_cid_tbl[cpu] = cid;
-		scx_cid_topo[cid] = SCX_CID_TOPO_NEG;
-	}
+	scx_cid_build_tail(&b, online_no_topo);
 
 	if (!cpumask_empty(llc_fallback))
 		pr_warn("scx_cid: cpus without cacheinfo, using node mask as llc: %*pbl\n",

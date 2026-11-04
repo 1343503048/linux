@@ -64,7 +64,7 @@ void scx_cmask_andnot(struct scx_cmask *dst, const struct scx_cmask *src);
 bool scx_cmask_subset(const struct scx_cmask *sub, const struct scx_cmask *super);
 bool scx_cmask_intersects(const struct scx_cmask *a, const struct scx_cmask *b);
 bool scx_cmask_empty(const struct scx_cmask *m);
-s32 scx_cid_init(struct scx_sched *sch);
+s32 scx_cid_init(void);
 int scx_cid_kfunc_init(void);
 void scx_cpumask_to_cmask(const struct cpumask *src, struct scx_cmask *dst);
 
